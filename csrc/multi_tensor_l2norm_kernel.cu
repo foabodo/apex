@@ -2,7 +2,6 @@
 #include <ATen/AccumulateType.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/Exceptions.h>
-#include <c10/cuda/CUDAGuard.h>
 // Another possibility:
 // #include <torch/all.h>
 
@@ -13,17 +12,6 @@
 
 #define BLOCK_SIZE 512
 #define ILP 4
-
-template<typename T>
-__device__ __forceinline__ bool is_aligned(T* p){
-  return ((uint64_t)p) % (ILP*sizeof(T)) == 0;
-}
-
-template<typename T>
-__device__ __forceinline__ void load_store(T* dst, T* src, int dst_offset, int src_offset){
-  typedef typename std::aligned_storage<ILP*sizeof(T), ILP*alignof(T)>::type LT;
-  ((LT*)dst)[dst_offset] = ((LT*)src)[src_offset];
-}
 
 template<typename x_t>
 struct L2NormFunctor
@@ -53,41 +41,19 @@ struct L2NormFunctor
     __shared__ float s_vals[512];
 
     float vals[ILP]; // = {0}; // this probably works too but I want to be sure...
-    x_t r_x[ILP];
     for(int i = 0; i < ILP; i++)
-    {
       vals[i] = 0.f;
-      r_x[i] = 0;
-    }
 
-    // to make things simple, we put aligned case in a different code path
-    if(n % ILP == 0 && chunk_size % ILP == 0 && is_aligned(x))
+    for(int i_start = 0; i_start < n && i_start < chunk_size; i_start += blockDim.x*ILP)
     {
-      for(int i_start = threadIdx.x; i_start*ILP < n && i_start*ILP < chunk_size; i_start += blockDim.x)
+      #pragma unroll
+      for(int ii = 0; ii < ILP; ii++)
       {
-        // load
-        load_store(r_x, x, 0 , i_start);
-#pragma unroll
-        for(int ii = 0; ii < ILP; ii++)
+        int i = i_start + threadIdx.x + ii*blockDim.x;
+        if(i < n && i < chunk_size)
         {
-          float next = static_cast<float>(r_x[ii]);
+          float next = static_cast<float>(x[i]);
           vals[ii] += next*next;
-        }
-      }
-    }
-    else
-    {
-      for(int i_start = 0; i_start < n && i_start < chunk_size; i_start += blockDim.x*ILP)
-      {
-#pragma unroll
-        for(int ii = 0; ii < ILP; ii++)
-        {
-          int i = i_start + threadIdx.x + ii*blockDim.x;
-          if(i < n && i < chunk_size)
-          {
-            float next = static_cast<float>(x[i]);
-            vals[ii] += next*next;
-          }
         }
       }
     }
@@ -138,41 +104,19 @@ struct MaxNormFunctor
     __shared__ float s_vals[512];
 
     float vals[ILP]; // = {0}; // this probably works too but I want to be sure...
-    x_t r_x[ILP];
     for(int i = 0; i < ILP; i++)
-    {
       vals[i] = 0.f;
-      r_x[i] = 0;
-    }
 
-    // to make things simple, we put aligned case in a different code path
-    if(n % ILP == 0 && chunk_size % ILP == 0 && is_aligned(x))
+    for(int i_start = 0; i_start < n && i_start < chunk_size; i_start += blockDim.x*ILP)
     {
-      for(int i_start = threadIdx.x; i_start*ILP < n && i_start*ILP < chunk_size; i_start += blockDim.x)
+      #pragma unroll
+      for(int ii = 0; ii < ILP; ii++)
       {
-        // load
-        load_store(r_x, x, 0 , i_start);
-#pragma unroll
-        for(int ii = 0; ii < ILP; ii++)
+        int i = i_start + threadIdx.x + ii*blockDim.x;
+        if(i < n && i < chunk_size)
         {
-          float next = static_cast<float>(r_x[ii]);
+          float next = static_cast<float>(x[i]);
           vals[ii] = fmaxf(fabsf(vals[ii]), fabsf(next));
-        }
-      }
-    }
-    else
-    {
-      for(int i_start = 0; i_start < n && i_start < chunk_size; i_start += blockDim.x*ILP)
-      {
-#pragma unroll
-        for(int ii = 0; ii < ILP; ii++)
-        {
-          int i = i_start + threadIdx.x + ii*blockDim.x;
-          if(i < n && i < chunk_size)
-          {
-            float next = static_cast<float>(x[i]);
-            vals[ii] = fmaxf(fabsf(vals[ii]), fabsf(next));
-          }
         }
       }
     }
@@ -323,7 +267,7 @@ std::tuple<at::Tensor, at::Tensor> multi_tensor_l2norm_cuda(
     ret_per_tensor = at::empty({0}, float_options);
   }
 
-  DISPATCH_FLOAT_HALF_AND_BFLOAT(tensor_lists[0][0].scalar_type(), 0, "multi_tensor_l2norm_cuda",
+  DISPATCH_FLOAT_AND_HALF(tensor_lists[0][0].scalar_type(), 0, "multi_tensor_l2norm_cuda",
     multi_tensor_apply<1>(
       BLOCK_SIZE,
       chunk_size,
@@ -336,13 +280,13 @@ std::tuple<at::Tensor, at::Tensor> multi_tensor_l2norm_cuda(
       max_chunks_per_tensor);)
 
   AT_CUDA_CHECK(cudaGetLastError());
+
   // AT_CUDA_CHECK(cudaDeviceSynchronize());
 
   // This involves one more small kernel launches, but will be negligible end to end.
   // I could get rid of these by hacking the functor + multi tensor harness with persistence
   // logic, but keeping it simple for now
   auto ret = at::empty({1}, output.options());
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(output));
   auto stream = at::cuda::getCurrentCUDAStream();
   cleanup<<<per_tensor ? ntensors : 1, 512, 0, stream>>>(
     output.DATA_PTR<float>(),
@@ -370,7 +314,7 @@ void multi_tensor_norm_out_cuda(
   const int norm_type)
 {
   auto float_options = tensor_lists[0][0].options().dtype(at::kFloat);
-  TORCH_CHECK(tensor_lists[0][0].device() == noop_flag.device(), "noop flag should be on the same device as tensors");
+
   // we don't need global thus uses empty here
   auto output = at::empty({320}, float_options);
 
@@ -427,11 +371,6 @@ void multi_tensor_norm_out_cuda(
   // I could get rid of these by hacking the functor + multi tensor harness with persistence
   // logic, but keeping it simple for now
   auto ret = at::empty({1}, output.options());
-
-  // Adding the following device guard since it happens sometimes that the
-  // tensors are on one device and the cuda stream is on another device which
-  // results in ILLEGAL MEM ACCESS error.
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(output));
   auto stream = at::cuda::getCurrentCUDAStream();
   cleanup_v2<<<ntensors, 512, 0, stream>>>(
     output.DATA_PTR<float>(),

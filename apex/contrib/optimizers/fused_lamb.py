@@ -8,7 +8,7 @@ class FusedLAMB(torch.optim.Optimizer):
     """Implements LAMB algorithm.
 
     Currently GPU-only.  Requires Apex to be installed via
-    ``pip install -v --no-cache-dir --global-option="--cpp_ext" --global-option="--cuda_ext" --global-option="--deprecated_fused_lamb" ./``.
+    ``pip install -v --no-cache-dir --global-option="--cpp_ext" --global-option="--cuda_ext" ./``.
 
     This version of fused LAMB implements 2 fusions.
 
@@ -54,7 +54,7 @@ class FusedLAMB(torch.optim.Optimizer):
         max_grad_norm (float, optional): value used to clip global grad norm
             (default: 1.0)
 
-    .. _Large Batch Optimization for Deep Learning - Training BERT in 76 minutes:
+    .. _Large Batch Optimization for Deep Learning\: Training BERT in 76 minutes:
         https://arxiv.org/abs/1904.00962
     .. _On the Convergence of Adam and Beyond:
         https://openreview.net/forum?id=ryQu7f-RZ
@@ -111,7 +111,7 @@ class FusedLAMB(torch.optim.Optimizer):
                     continue
                 if p.dtype == torch.float32:
                     g_all_32.append(p.grad.data)
-                elif p.dtype == torch.float16:
+                elif p.dytpe == torch.float16:
                     g_all_16.append(p.grad.data)
                 else:
                     raise RuntimeError('FusedLAMB only support fp16 and fp32.')

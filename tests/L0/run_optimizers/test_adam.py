@@ -1,238 +1,164 @@
-import copy
-import math
-import random
 import unittest
+import os
+import random
 
 import torch
-import torch.nn.functional as F
-from torch import nn
+import apex
 
-try:
-    import apex
-except ImportError as e:
-    HAS_APEX = False
-else:
-    HAS_APEX = True
+class TestFusedAdam(unittest.TestCase):
+    def setUp(self, max_abs_diff=1e-3, max_rel_diff=1, iters=7):
+        self.max_abs_diff = max_abs_diff
+        self.max_rel_diff = max_rel_diff
+        self.iters = iters
+        torch.cuda.manual_seed(9876)
 
+    def tearDown(self):
+        pass
 
-class Model(torch.nn.Module):
-    def __init__(self):
-        super(Model, self).__init__()
-        self.conv1 = nn.Conv2d(1, 6, 5)
-        self.relu1 = nn.ReLU()
-        self.pool1 = nn.MaxPool2d(2)
-        self.conv2 = nn.Conv2d(6, 16, 5)
-        self.relu2 = nn.ReLU()
-        self.pool2 = nn.MaxPool2d(2)
-        self.fc1 = nn.Linear(256, 120)
-        self.relu3 = nn.ReLU()
-        self.fc2 = nn.Linear(120, 84)
-        self.relu4 = nn.ReLU()
-        self.fc3 = nn.Linear(84, 10)
-        self.relu5 = nn.ReLU()
+    def gen_param_optim(self, tensors, adam_option):
+        ref_param = []
+        tst_param = []
+        for tensor in tensors:
+            ref_param.append(torch.nn.Parameter(tensor.clone()))
+            tst_param.append(torch.nn.Parameter(tensor.clone()))
 
-    def forward(self, x):
-        y = self.conv1(x)
-        y = self.relu1(y)
-        y = self.pool1(y)
-        y = self.conv2(y)
-        y = self.relu2(y)
-        y = self.pool2(y)
-        y = y.reshape(y.shape[0], -1)
-        y = self.fc1(y)
-        y = self.relu3(y)
-        y = self.fc2(y)
-        y = self.relu4(y)
-        y = self.fc3(y)
-        y = self.relu5(y)
-        return y 
+        ref_optim = torch.optim.Adam(ref_param, **adam_option)
+        tst_optim = apex.optimizers.FusedAdam(tst_param, **adam_option)
 
+        return (ref_param, tst_param, ref_optim, tst_optim)
 
-@unittest.skipIf(not HAS_APEX, "`apex` is not found.")
-class AdamTest(unittest.TestCase):
-    def setUp(self, seed=0):
-        super().setUp()
-        torch.manual_seed(seed)
+    def gen_grad(self, ref_param, tst_param):
+        for p_ref, p_tst in zip(ref_param, tst_param):
+            p_ref.grad = torch.rand_like(p_ref)
+            p_tst.grad = p_ref.grad
 
-        self.model = Model().cuda()
-        self.model_ = Model().cuda()
-        self.model_.load_state_dict(copy.deepcopy(self.model.state_dict()))
+    def gen_mixed_grad(self, ref_param, tst_param, scale=1.0):
+        half_grads = []
+        for p_ref, p_tst in zip(ref_param, tst_param):
+            half_grads.append(torch.rand_like(p_ref).half())
+            p_ref.grad = half_grads[-1].float() / scale
+        return half_grads
 
-        self.lr = 0.00001
-        params = [p for p in self.model.parameters() if p.requires_grad]
-        self.optimizer = torch.optim.Adam(params, lr=self.lr)
+    def get_max_diff(self, ref_param, tst_param):
+        max_abs_diff = max_rel_diff = 0
+        for p_ref, p_tst in zip(ref_param, tst_param):
+            max_abs_diff_p = (p_ref - p_tst).abs().max().item()
+            max_rel_diff_p = ((p_ref - p_tst) / p_ref).abs().max().item()
 
-    def testGradScaler(self):
-        params_ = [p for p in self.model_.parameters() if p.requires_grad]
-        optimizer_ = apex.optimizers.FusedAdam(params_, lr=self.lr, capturable=False)
-        scaler = torch.cuda.amp.GradScaler(enabled=True)
-        scaler_ = torch.cuda.amp.GradScaler(enabled=True)
+            if max_abs_diff_p > max_abs_diff:  max_abs_diff = max_abs_diff_p
+            if max_rel_diff_p > max_rel_diff:  max_rel_diff = max_rel_diff_p
 
-        for i in range(100):
-            x = torch.rand([32, 1, 28, 28]).cuda().to(memory_format=torch.channels_last)
-            x_ = x.clone()
-            gt = torch.rand([32, 10]).cuda()
-            gt_ = gt.clone()
+        return max_abs_diff, max_rel_diff
 
-            # Reference
-            with torch.cuda.amp.autocast(enabled=True):
-                y = self.model(x)
-                loss = ((gt - y) ** 2).mean()
+    def gen_single_type_test(self, param_type=torch.float):
+        nelem = 278011
+        adam_option = {'lr':5e-4, 'betas':(0.9, 0.999), 'eps':1e-08,
+            'weight_decay':0, 'amsgrad':False}
 
-            scaler.scale(loss).backward()
-            scaler.step(self.optimizer)
-            scaler.update()
-            
-            # DUT
-            with torch.cuda.amp.autocast(enabled=True):
-                y = self.model_(x)
-                loss_ = ((gt_ - y) ** 2).mean()
+        tensor = torch.rand(nelem, dtype=param_type, device='cuda')
+        ref_param, tst_param, ref_optim, tst_optim = \
+            self.gen_param_optim([tensor], adam_option)
 
-            scaler_.scale(loss_).backward()
-            scaler_.step(optimizer_)
-            scaler_.update()
+        for i in range(self.iters):
+            self.gen_grad(ref_param, tst_param)
+            ref_optim.step()
+            tst_optim.step()
+            max_abs_diff, max_rel_diff = self.get_max_diff(ref_param, tst_param)
 
-            for module in zip(self.model.modules(), self.model_.modules()):
-                m = module[0]
-                m_ = module[1]
-                if isinstance(m, nn.Conv2d) or isinstance(m_, nn.Linear):
-                    torch.testing.assert_close(m.weight, m_.weight, atol=1e-3, rtol=1e-3, equal_nan=True)
-                    torch.testing.assert_close(m.weight.grad, m_.weight.grad, atol=1e-3, rtol=1e-3, equal_nan=True)
+            self.assertLessEqual(max_abs_diff, self.max_abs_diff)
+            self.assertLessEqual(max_rel_diff, self.max_rel_diff)
 
-            # Init for next iteration
-            self.optimizer.zero_grad()
-            optimizer_.zero_grad()
+    def test_float(self):
+        self.gen_single_type_test(param_type=torch.float)
 
-            self.model_.load_state_dict(copy.deepcopy(self.model.state_dict()))
-    
-    def testGradScalerCapturable(self):
-        params_ = [p for p in self.model_.parameters() if p.requires_grad]
-        optimizer_ = apex.optimizers.FusedAdam(params_, lr=self.lr, capturable=True)
-        scaler = torch.cuda.amp.GradScaler(enabled=True)
-        scaler_ = torch.cuda.amp.GradScaler(enabled=True)
+    def test_half(self):
+        self.gen_single_type_test(param_type=torch.float16)
 
-        for i in range(100):
-            x = torch.rand([32, 1, 28, 28]).cuda().to(memory_format=torch.channels_last)
-            x_ = x.clone()
-            gt = torch.rand([32, 10]).cuda()
-            gt_ = gt.clone()
+    @unittest.skip('Disable until 8/1/2019 adam/adamw upstream picked')
+    def test_multi_params(self):
+        sizes = [[4096, 1024], [4096], [4096, 2048], [32320, 1024], [1]]
+        adam_option = {'lr':5e-4, 'betas':(0.9, 0.999), 'eps':1e-08,
+            'weight_decay':0, 'amsgrad':False}
 
-            # Reference
-            with torch.cuda.amp.autocast(enabled=True):
-                y = self.model(x)
-                loss = ((gt - y) ** 2).mean()
+        tensors = []
+        for size in sizes:
+            tensors.append(torch.rand(size, dtype=torch.float, device='cuda'))
+        ref_param, tst_param, ref_optim, tst_optim = \
+            self.gen_param_optim(tensors, adam_option)
 
-            scaler.scale(loss).backward()
-            scaler.step(self.optimizer)
-            scaler.update()
-            
-            # DUT
-            with torch.cuda.amp.autocast(enabled=True):
-                y = self.model_(x)
-                loss_ = ((gt_ - y) ** 2).mean()
+        for i in range(self.iters):
+            self.gen_grad(ref_param, tst_param)
+            ref_optim.step()
+            tst_optim.step()
+            max_abs_diff, max_rel_diff = self.get_max_diff(ref_param, tst_param)
+            self.assertLessEqual(max_abs_diff, self.max_abs_diff)
+            self.assertLessEqual(max_rel_diff, self.max_rel_diff)
 
-            scaler_.scale(loss_).backward()
-            scaler_.step(optimizer_)
-            scaler_.update()
+    @unittest.skip('No longer support fuse scaling')
+    def test_scale(self):
+        nelem = 278011
+        adam_option = {'lr':5e-4, 'betas':(0.9, 0.999), 'eps':1e-08,
+            'weight_decay':0, 'amsgrad':False}
 
-            for module in zip(self.model.modules(), self.model_.modules()):
-                m = module[0]
-                m_ = module[1]
-                if isinstance(m, nn.Conv2d) or isinstance(m_, nn.Linear):
-                    torch.testing.assert_close(m.weight, m_.weight, atol=1e-3, rtol=1e-3, equal_nan=True)
-                    torch.testing.assert_close(m.weight.grad, m_.weight.grad, atol=1e-3, rtol=1e-3, equal_nan=True)
+        tensor = torch.rand(nelem, dtype=torch.float, device='cuda')
+        ref_param, tst_param, ref_optim, tst_optim = \
+            self.gen_param_optim([tensor], adam_option)
 
-            # Init for next iteration
-            self.optimizer.zero_grad()
-            optimizer_.zero_grad()
+        for i in range(self.iters):
+            scale = random.random() * 1000
+            half_grads = self.gen_mixed_grad(ref_param, tst_param, scale)
+            ref_optim.step()
+            tst_optim.step(grads=half_grads, scale=scale)
+            max_abs_diff, max_rel_diff = self.get_max_diff(ref_param, tst_param)
 
-            self.model_.load_state_dict(copy.deepcopy(self.model.state_dict()))
+            self.assertLessEqual(max_abs_diff, self.max_abs_diff)
+            self.assertLessEqual(max_rel_diff, self.max_rel_diff)
 
-    def testGradScalerCapturableMaster(self):
-        # Cast conv layers to FP16
-        for m in self.model_.modules():
-            if m.__class__ in [torch.nn.Conv2d]:
-                m.half()
-        params_ = [p for p in self.model_.parameters() if p.requires_grad]
-        optimizer_ = apex.optimizers.FusedAdam(params_, lr=self.lr, capturable=True, master_weights=True)
-        scaler = torch.cuda.amp.GradScaler(enabled=True)
-        scaler_ = torch.cuda.amp.GradScaler(enabled=True)
+    @unittest.skip('No longer support output fp16 param')
+    def test_fp16_output(self):
+        nelem = 278011
+        adam_option = {'lr':5e-4, 'betas':(0.9, 0.999), 'eps':1e-08,
+            'weight_decay':0, 'amsgrad':False}
 
-        for i in range(100):
-            x = torch.rand([32, 1, 28, 28]).cuda().to(memory_format=torch.channels_last)
-            x_ = x.clone()
-            gt = torch.rand([32, 10]).cuda()
-            gt_ = gt.clone()
+        tensor = torch.rand(nelem, dtype=torch.float, device='cuda')
+        ref_param, tst_param, ref_optim, tst_optim = \
+            self.gen_param_optim([tensor], adam_option)
 
-            # Reference
-            with torch.cuda.amp.autocast(enabled=True):
-                y = self.model(x)
-                loss = ((gt - y) ** 2).mean()
+        fp16_param = torch.nn.Parameter(tensor.clone().half())
 
-            scaler.scale(loss).backward()
-            scaler.step(self.optimizer)
-            scaler.update()
+        for i in range(self.iters):
+            half_grads = self.gen_mixed_grad(ref_param, tst_param)
+            ref_optim.step()
+            tst_optim.step(grads=half_grads, output_params=[fp16_param])
 
-            # DUT
-            with torch.cuda.amp.autocast(enabled=True):
-                y = self.model_(x)
-                loss_ = ((gt_ - y) ** 2).mean()
+            max_abs_diff, max_rel_diff = self.get_max_diff(ref_param, tst_param)
+            self.assertLessEqual(max_abs_diff, self.max_abs_diff)
+            self.assertLessEqual(max_rel_diff, self.max_rel_diff)
 
-            scaler_.scale(loss_).backward()
-            scaler_.step(optimizer_)
-            scaler_.update()
+            max_abs_diff, max_rel_diff = self.get_max_diff(tst_param, \
+                [fp16_param.float()])
+            self.assertLessEqual(max_abs_diff, self.max_abs_diff)
+            self.assertLessEqual(max_rel_diff, self.max_rel_diff)
 
-            for module in zip(self.model.modules(), self.model_.modules()):
-                m = module[0]
-                m_ = module[1]
-                if isinstance(m, nn.Conv2d) or isinstance(m_, nn.Linear):
-                    torch.testing.assert_close(m.weight, m_.weight.float(), atol=1e-3, rtol=1e-3, equal_nan=True)
-                    torch.testing.assert_close(m.weight.grad, m_.weight.grad.float(), atol=1e-3, rtol=1e-3, equal_nan=True)
+    def test_adam_option(self):
+        nelem = 1
+        adam_option = {'lr':0.01, 'betas':(0.6, 0.9), 'eps':3e-06,
+            'weight_decay':0, 'amsgrad':False}
 
-            # Init for next iteration
-            self.optimizer.zero_grad()
-            optimizer_.zero_grad()
+        tensor = torch.rand(nelem, dtype=torch.float, device='cuda')
+        ref_param, tst_param, ref_optim, tst_optim = \
+            self.gen_param_optim([tensor], adam_option)
 
-            self.model_.load_state_dict(copy.deepcopy(self.model.state_dict()))
+        for i in range(self.iters):
+            self.gen_grad(ref_param, tst_param)
+            ref_optim.step()
+            tst_optim.step()
+            max_abs_diff, max_rel_diff = self.get_max_diff(ref_param, tst_param)
 
-    def testNative(self):
-        params_ = [p for p in self.model_.parameters() if p.requires_grad]
-        optimizer_ = apex.optimizers.FusedAdam(params_, lr=self.lr, capturable=False)
-
-        for i in range(100):
-            x = torch.rand([32, 1, 28, 28]).cuda().to(memory_format=torch.channels_last)
-            x_ = x.clone()
-            gt = torch.rand([32, 10]).cuda()
-            gt_ = gt.clone()
-
-            # Reference
-            y = self.model(x)
-            loss = ((gt - y) ** 2).mean()
-
-            loss.backward()
-            self.optimizer.step()
-            
-            # DUT
-            y = self.model_(x)
-            loss_ = ((gt_ - y) ** 2).mean()
-
-            loss_.backward()
-            optimizer_.step()
-
-            for module in zip(self.model.modules(), self.model_.modules()):
-                m = module[0]
-                m_ = module[1]
-                if isinstance(m, nn.Conv2d) or isinstance(m_, nn.Linear):
-                    torch.testing.assert_close(m.weight, m_.weight, atol=1e-3, rtol=1e-3, equal_nan=True)
-                    torch.testing.assert_close(m.weight.grad, m_.weight.grad, atol=1e-3, rtol=1e-3, equal_nan=True)
-
-            # Init for next iteration
-            self.optimizer.zero_grad()
-            optimizer_.zero_grad()
-            
-            self.model_.load_state_dict(copy.deepcopy(self.model.state_dict()))
+            self.assertLessEqual(max_abs_diff, self.max_abs_diff)
+            self.assertLessEqual(max_rel_diff, self.max_rel_diff)
 
 
 if __name__ == '__main__':
+    script_path = os.path.dirname(os.path.realpath(__file__))
     unittest.main()
-
